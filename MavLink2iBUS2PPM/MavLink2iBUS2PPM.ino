@@ -16,10 +16,13 @@
 // thus I get only 9 channels (could make channel 10 a derived channel).
 // As a result, I chose to send  9 channels over PPM
 // Unfortunately, there is no way to input high channels in trainer mode yet. Would be nice for head-tracker.
+#include <SoftwareSerial.h>
 
+SoftwareSerial mavlinkSerial(8, 9); // RX, TX
+#include <GCS_MAVLink.h>
 #include <string.h>
 
-#define PPM_CHANS 10   // The number of iBus channels to send as PPM. 14 is supported. 10 from FS-i6
+#define PPM_CHANS 9   // The number of iBus channels to send as PPM. 14 is supported. 10 from FS-i6
            // No reason to send more than the FC will need.
           // If going above 10 channels, you need to add more channels to the unrolled loop in readRX()
 
@@ -67,23 +70,59 @@ static uint16_t rcValueSafe[IBUS_MAXCHANNELS]; // read by interrupt handler. Dat
 static boolean rxFrameDone;
 static boolean failsafe = 0;
 uint16_t dummy;
+#define START    1
+#define MSG_RATE    10 // Hertz
 
+#define SYSID 200
+#define COMPID 190  //190 MissionPlanner
+#define TARSYS 1
+#define TARCOMP 0 //0 all
+#define LEDPIN 13
+
+// Message #0  HEARTHBEAT 
+uint8_t  ap_type = 0, ap_autopilot = 0, ap_base_mode = 0, ap_system_status = 0, ap_mavlink_version = 0;
+uint32_t  ap_custom_mode = 0;
+
+// Message # 1  SYS_STATUS 
+uint16_t  ap_voltage_battery = 0;  //mV
+int16_t  ap_current_battery = 0;  //dA
+
+// Message #24  GPS_RAW_INT 
+uint8_t  ap_sat_visible = 0, ap_fixtype = 1;  //0= No GPS, 1 = No Fix, 2 = 2D Fix, 3 = 3D Fix
+int32_t  ap_latitude = 0, ap_longitude = 0, ap_gps_altitude = 0;
+
+// Message #74 VFR_HUD 
+int32_t    ap_airspeed = 0;
+uint32_t  ap_groundspeed = 0, ap_heading = 0;
+uint16_t  ap_throttle = 0;
+int32_t    ap_bar_altitude = 0, ap_climb_rate=0;
+uint16_t load = 0;
+// Message #27 RAW IMU 
+int32_t   ap_accX = 0, ap_accY = 0, ap_accZ = 0;
+
+uint8_t     MavLink_Connected, buf[MAVLINK_MAX_PACKET_LEN];
+uint16_t  hb_count, len;
+unsigned long MavLink_Connected_timer, hb_timer, acc_timer, deb_timer;
+
+mavlink_message_t msg;
 // Prototypes
 void setupRx();
 void readRx();
-
 void setup() {
 
   setupRx();
   setupPpm();
   pinMode(13, OUTPUT);
   digitalWrite(13, HIGH);  // Checksum error - turn on error LED
-  //Serial.println("Init complete");
+  Serial.println("Init complete");
+  mavlinkSerial.begin(9600);
 
 }
 
 void loop() {
-  readRx();  
+    hb_control();
+  mavlink_receive(); 
+//  readRx();  
   // PPM output is run as timer events, so all we do here is read input, populating global array
 }
 
@@ -263,4 +302,118 @@ ISR(TIMER1_COMPA_vect){  //leave this alone
 
 
 
+void mavlink_receive()  //to run when you want to receive updated informations
+{ 
+  mavlink_message_t msg;
+  mavlink_status_t status;
+  while(mavlinkSerial.available()) 
+  { 
+//Serial.println("voll da");
+uint8_t c = mavlinkSerial.read();
+    
+    if(mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &status)) 
+    {
+      switch(msg.msgid)
+      {
+        case MAVLINK_MSG_ID_HEARTBEAT:  // 0
+        Serial.println("HEARTBEAT");
+          ap_base_mode = (mavlink_msg_heartbeat_get_base_mode(&msg) & 0x80) > 7;
+          ap_custom_mode = mavlink_msg_heartbeat_get_custom_mode(&msg);
+          MavLink_Connected_timer=millis(); 
+          if(!MavLink_Connected);
+          {
+            hb_count++;   
+            Serial.println(hb_count);
+            if((hb_count++) > 10)
+            {        // If  received > 10 heartbeats from MavLink then we are connected
+              MavLink_Connected=1;
+              hb_count=0;
+              digitalWrite(LEDPIN,HIGH);      // ledPin will be ON when connected to MavLink, else it will slowly blink
+            }
+          }
+          break;
+        
+        case MAVLINK_MSG_ID_SYS_STATUS :
+        Serial.println("STATUS");
+        // 1
+          ap_voltage_battery = mavlink_msg_sys_status_get_voltage_battery(&msg);  // 1 = 1mV
+          load = mavlink_msg_sys_status_get_load(&msg);
+          //ap_current_battery = Get_Current_Average(mavlink_msg_sys_status_get_current_battery(&msg));     // 1=10mA
+         Serial.print("voltage : ");
+         Serial.println(ap_voltage_battery);
+         Serial.print("load : ");
+         Serial.println(load);
+          break;
+          
+        case MAVLINK_MSG_ID_GPS_RAW_INT:   // 24
+          ap_fixtype = mavlink_msg_gps_raw_int_get_fix_type(&msg);                               // 0 = No GPS, 1 =No Fix, 2 = 2D Fix, 3 = 3D Fix
+          ap_sat_visible =  mavlink_msg_gps_raw_int_get_satellites_visible(&msg);          // numbers of visible satelites
+          if(ap_fixtype == 3)
+          {
+            ap_latitude = mavlink_msg_gps_raw_int_get_lat(&msg);
+            ap_longitude = mavlink_msg_gps_raw_int_get_lon(&msg);
+            ap_gps_altitude = mavlink_msg_gps_raw_int_get_alt(&msg);    // 1m =1000
+          }
+          break;
+        
+        case MAVLINK_MSG_ID_RAW_IMU:   // 27
+          ap_accX = mavlink_msg_raw_imu_get_xacc(&msg) / 10;                // 
+          ap_accY = mavlink_msg_raw_imu_get_yacc(&msg) / 10;
+          ap_accZ = mavlink_msg_raw_imu_get_zacc(&msg) / 10;
+          //Serial.print(ap_accX);
+          break;
+        
+        case MAVLINK_MSG_ID_VFR_HUD:   //  74
+          ap_airspeed = 0;
+          ap_groundspeed = mavlink_msg_vfr_hud_get_groundspeed(&msg);      // 100 = 1m/s
+          ap_heading = mavlink_msg_vfr_hud_get_heading(&msg);     // 100 = 100 deg
+          ap_throttle = mavlink_msg_vfr_hud_get_throttle(&msg);        //  100 = 100%
+          ap_bar_altitude = mavlink_msg_vfr_hud_get_alt(&msg) * 100;        //  m
+          ap_climb_rate=mavlink_msg_vfr_hud_get_climb(&msg) * 100;        //  m/s
+          break;
+        
+        default:
+          break;
+      }
+    }
+  }
+}
+
+void hb_control()   //To run every loop
+{
+  
+  if(millis()-hb_timer > 1500)
+  {
+    hb_timer=millis();
+    if(!MavLink_Connected)  // Start requesting data streams from MavLink
+    {
+      Serial.println("hb_control");
+      digitalWrite(LEDPIN,HIGH);
+      
+      mavlink_msg_request_data_stream_pack(SYSID, COMPID, &msg, TARSYS, TARCOMP, MAV_DATA_STREAM_EXTENDED_STATUS, MSG_RATE, START);
+      len = mavlink_msg_to_send_buffer(buf, &msg);
+      mavlinkSerial.write(buf,len);
+      
+      delay(10);
+      
+      mavlink_msg_request_data_stream_pack(SYSID, COMPID, &msg, TARSYS, TARCOMP, MAV_DATA_STREAM_EXTRA2, MSG_RATE, START);
+      len = mavlink_msg_to_send_buffer(buf, &msg);
+      mavlinkSerial.write(buf,len);
+      
+      delay(10);
+      
+      mavlink_msg_request_data_stream_pack(SYSID, COMPID, &msg, TARSYS, TARCOMP ,MAV_DATA_STREAM_RAW_SENSORS, MSG_RATE, START);
+      len = mavlink_msg_to_send_buffer(buf, &msg);
+      mavlinkSerial.write(buf,len);
+      
+      digitalWrite(LEDPIN,LOW);
+    }
+  }
+  
+  if((millis() - MavLink_Connected_timer) > 1500)
+  {
+    MavLink_Connected=0;
+    hb_count = 0;
+  } 
+}
 
