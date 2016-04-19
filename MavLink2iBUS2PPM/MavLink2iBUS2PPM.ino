@@ -16,11 +16,26 @@
 // thus I get only 9 channels (could make channel 10 a derived channel).
 // As a result, I chose to send  9 channels over PPM
 // Unfortunately, there is no way to input high channels in trainer mode yet. Would be nice for head-tracker.
-#include <SoftwareSerial.h>
 #include <PulsePosition.h>
-SoftwareSerial mavlinkSerial(8, 9); // RX, TX
+PulsePositionOutput ppmOutput;
+#define mavlinkSerial Serial1
+#define ibusSerial Serial2
+
+//SoftwareSerial mavlinkSerial(8, 9); // RX, TX
 #include <GCS_MAVLink.h>
 #include <string.h>
+// NEW PPM CONFIGURATION
+#define TX_DEFAULT_SIGNAL 1500.0
+#define RX_MINIMUM_SPACE 3500.0
+#define IBUS_MAX_CHANNEL 10
+#define IBUS_BUFFSIZE 32
+#define IBUS_SYNCBYTE 0x20
+#define IBUS_BAUDRATE 115200
+#define MAVLINK_BAUDRATE 57600
+#define PPM_PIN 6
+#define LED_PIN 11
+
+
 #define PPM_CHANS 9   // The number of iBus channels to send as PPM. 14 is supported. 10 from FS-i6
            // No reason to send more than the FC will need.
           // If going above 10 channels, you need to add more channels to the unrolled loop in readRX()
@@ -44,9 +59,9 @@ static uint16_t rcFailsafe[IBUS_MAXCHANNELS] = {  1500, 1500, 950, 1500, 2000, 1
 //////////////////////PPM CONFIGURATION///////////////////////////////
 ///// PPM_FrLen might be lowered a bit for higher refresh rates, as all channels
 ///// will rarely be at max at the same time. For 8 channel normal is 22.5ms.
-#define default_servo_value 1500  //set the default servo value
+//#define default_servo_value 1500  //set the default servo value 1
 #define PPM_PulseLen 400  //set the pulse length
-#define PPM_Pause 3500    // Pause between PPM frames in microseconds (1ms = 1000µs) - Standard is 6500
+//#define PPM_Pause 3500    // Pause between PPM frames in microseconds (1ms = 1000µs) - Standard is 6500 1
 #define PPM_FrLen (((1700+PPM_PulseLen) * PPM_CHANS)  + PPM_Pause)  //set the PPM frame length in microseconds 
     // PPM_FrLen can be adjusted down for faster refresh. Must be tested with PPM consumer (Flight Controller)
     // PPM_VariableFrames uses variable frame length. I.e. after writing channels, wait for PPM_Pause, and then next packet.
@@ -76,7 +91,11 @@ uint16_t dummy;
 #define COMPID 190  //190 MissionPlanner
 #define TARSYS 1
 #define TARCOMP 0 //0 all
-#define LEDPIN 13
+// Pin 13 has an LED connected on most Arduino boards.
+// Pin 11 has the LED on Teensy 2.0
+// Pin 6  has the LED on Teensy++ 2.0
+// Pin 13 has the LED on Teensy 3.0 3.1 3.2
+#define LED_PIN 13
 
 // Message #0  HEARTHBEAT 
 uint8_t  ap_type = 0, ap_autopilot = 0, ap_base_mode = 0, ap_system_status = 0, ap_mavlink_version = 0;
@@ -107,20 +126,23 @@ mavlink_message_t msg;
 // Prototypes
 void setupRx();
 void readRx();
-void setup() {
+void hb_control();
+void mavlink_receive();
 
-  setupRx();
-  setupPpm();
-  pinMode(13, OUTPUT);
-  digitalWrite(13, HIGH);  // Checksum error - turn on error LED
+void setup() {
+//  setupRx();
+//  setupPpm();
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, HIGH);  // Checksum error - turn on error LED
   Serial.println("Init complete");
-  mavlinkSerial.begin(9600);
+  mavlinkSerial.begin(MAVLINK_BAUDRATE);
+//  ibusSerial.begin(57600);
 
 }
 
 void loop() {
     hb_control();
-  mavlink_receive(); 
+    mavlink_receive(); 
 //  readRx();  
   // PPM output is run as timer events, so all we do here is read input, populating global array
 }
@@ -132,7 +154,7 @@ void setupRx()
 {
   uint8_t i;
   for (i = 0; i < PPM_CHANS; i++) { rcValue[i] = 1127; }
-  Serial.begin(115200);
+  ibusSerial.begin(IBUS_BAUDRATE);
 }
 
 void readRx()
@@ -142,12 +164,12 @@ void readRx()
 
   rxFrameDone = false;
 
-  uint8_t avail = Serial.available();
+  uint8_t avail = ibusSerial.available();
   
   if (avail)
   {
     digitalWrite(4, LOW);
-    uint8_t val = Serial.read();
+    uint8_t val = ibusSerial.read();
     // Look for 0x2040 as start of packet
     if (ibusIndex == 0 && val != 0x20) {
       return;
@@ -191,7 +213,7 @@ void readRx()
           cli(); // disable interrupts
           memcpy(rcValueSafe, rcFailsafe, IBUS_MAXCHANNELS * sizeof(uint16_t));
           sei();
-          digitalWrite(13, HIGH);  //  Error - turn on error LED
+          digitalWrite(LED_PIN, HIGH);  //  Error - turn on error LED
         }
         else
         {
@@ -216,10 +238,10 @@ void readRx()
           rcValueSafe[SWAPCH6-1] = rcValue[5];
 #endif          
           sei();
-          digitalWrite(13, LOW); // OK packet - Clear error LED
+          digitalWrite(LED_PIN, LOW); // OK packet - Clear error LED
         }
       } else {
-        digitalWrite(13, HIGH);  // Checksum error - turn on error LED
+        digitalWrite(LED_PIN, HIGH);  // Checksum error - turn on error LED
       }
       return;
     }
@@ -227,21 +249,7 @@ void readRx()
 }
 
 static byte cur_chan_numb;
-void setupPpm(){  
 
-  pinMode(sigPin, OUTPUT);
-  digitalWrite(sigPin, !onState);  //set the PPM signal pin to the default state (off)
-  cur_chan_numb = 0;
-  cli();
-  TCCR1A = 0; // set entire TCCR1 register to 0
-  TCCR1B = 0;
-  
-  OCR1A = 100;  // compare match register, changed on the fly. First call in 100*0.5us.
-  TCCR1B |= (1 << WGM12);  // turn on CTC mode
-  TCCR1B |= (1 << CS11);  // 8 prescaler: 0,5 microseconds at 16mhz
-  TIMSK1 |= (1 << OCIE1A); // enable timer compare interrupt
-  sei();
-}
 
 // PPM sum is a signal consisting of a pulse of PPM_PulseLen, followed by a non-pulse 
 // defining the signal value. So a 300us PPM-pulse and 1200us pause means the value 
@@ -257,48 +265,7 @@ void setupPpm(){
 // If you want more channels, increase the framelen, to say 12*2000 + 3000 = 27000.
 
 
-  ISR(TIMER1_COMPA_vect){  //leave this alone
-  static boolean state = true;
-
-  cli();
-  TCNT1 = 0;
-
-  if(state) {  //start pulse
-    digitalWrite(sigPin, onState);
-    // Set timer that determines when interrupt is called again
-    // This is the initial PPM_PulseLen marker
-    OCR1A = PPM_PulseLen * 2;
-    state = false;
-  }
-  else{  //end pulse and calculate when to start the next pulse
-    static unsigned int calc_signal; 
-
-    // marker ended, so now pause for the channel value us
-    digitalWrite(sigPin, !onState);
-    // Make sure next interrupt causes a marker
-    state = true;
-
-    // Last channel, so set time to wait for full frame
-    if(cur_chan_numb >= PPM_CHANS){
-      cur_chan_numb = 0;
-      if (PPM_VariableFrames) {
-        OCR1A = PPM_Pause * 2;  // Wait for PPM_Pause
-      } else { // static frame length
-        calc_signal = calc_signal + PPM_PulseLen; //Compute time spent
-        OCR1A = (PPM_FrLen - calc_signal) * 2;  // Wait until complete frame has passed
-      }
-      calc_signal = 0;
-    }
-    else{                                    
-      OCR1A = (rcValueSafe[cur_chan_numb] - PPM_PulseLen) * 2 + (2*PPM_offset); // Set interrupt timer for the spacing = channel value
-                                                                                                                
-      calc_signal +=  rcValueSafe[cur_chan_numb];
-      cur_chan_numb++;
-    }     
-  }
-  sei();
-}
-
+ 
 
 
 void mavlink_receive()  //to run when you want to receive updated informations
@@ -309,7 +276,6 @@ void mavlink_receive()  //to run when you want to receive updated informations
   { 
 //Serial.println("voll da");
 uint8_t c = mavlinkSerial.read();
-    
     if(mavlink_parse_char(MAVLINK_COMM_0, c, &msg, &status)) 
     {
       switch(msg.msgid)
@@ -327,7 +293,7 @@ uint8_t c = mavlinkSerial.read();
             {        // If  received > 10 heartbeats from MavLink then we are connected
               MavLink_Connected=1;
               hb_count=0;
-              digitalWrite(LEDPIN,HIGH);      // ledPin will be ON when connected to MavLink, else it will slowly blink
+              digitalWrite(LED_PIN,HIGH);      // LED_PIN will be ON when connected to MavLink, else it will slowly blink
             }
           }
           break;
@@ -387,7 +353,7 @@ void hb_control()   //To run every loop
     if(!MavLink_Connected)  // Start requesting data streams from MavLink
     {
       Serial.println("hb_control");
-      digitalWrite(LEDPIN,HIGH);
+      digitalWrite(LED_PIN,HIGH);
       
       mavlink_msg_request_data_stream_pack(SYSID, COMPID, &msg, TARSYS, TARCOMP, MAV_DATA_STREAM_EXTENDED_STATUS, MSG_RATE, START);
       len = mavlink_msg_to_send_buffer(buf, &msg);
@@ -405,7 +371,7 @@ void hb_control()   //To run every loop
       len = mavlink_msg_to_send_buffer(buf, &msg);
       mavlinkSerial.write(buf,len);
       
-      digitalWrite(LEDPIN,LOW);
+      digitalWrite(LED_PIN,LOW);
     }
   }
   
