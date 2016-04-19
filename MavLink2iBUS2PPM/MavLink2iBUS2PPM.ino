@@ -17,11 +17,10 @@
 // As a result, I chose to send  9 channels over PPM
 // Unfortunately, there is no way to input high channels in trainer mode yet. Would be nice for head-tracker.
 #include <SoftwareSerial.h>
-
+#include <PulsePosition.h>
 SoftwareSerial mavlinkSerial(8, 9); // RX, TX
 #include <GCS_MAVLink.h>
 #include <string.h>
-
 #define PPM_CHANS 9   // The number of iBus channels to send as PPM. 14 is supported. 10 from FS-i6
            // No reason to send more than the FC will need.
           // If going above 10 channels, you need to add more channels to the unrolled loop in readRX()
@@ -258,7 +257,7 @@ void setupPpm(){
 // If you want more channels, increase the framelen, to say 12*2000 + 3000 = 27000.
 
 
-ISR(TIMER1_COMPA_vect){  //leave this alone
+  ISR(TIMER1_COMPA_vect){  //leave this alone
   static boolean state = true;
 
   cli();
